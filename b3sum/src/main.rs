@@ -24,6 +24,7 @@ const RAW_ARG: &str = "raw";
 const CHECK_ARG: &str = "check";
 const QUIET_ARG: &str = "quiet";
 const RECURSE_ARG: &str = "recurse";
+const DIGEST_ARG: &str = "digest";
 
 struct Args {
     inner: clap::ArgMatches<'static>,
@@ -124,6 +125,14 @@ impl Args {
                         "Recurse through any directories supplied",
                     ),
             )
+            .arg(
+                Arg::with_name(DIGEST_ARG)
+                    .long(DIGEST_ARG)
+                    .short("d")
+                    .help(
+                        "Create a digest checksum for all files processed",
+                    ),
+            )
             // wild::args_os() is equivalent to std::env::args_os() on Unix,
             // but on Windows it adds support for globbing.
             .get_matches_from(wild::args_os());
@@ -197,6 +206,10 @@ impl Args {
 
     fn recurse(&self) -> bool {
         self.inner.is_present(RECURSE_ARG)
+    }
+
+    fn digest(&self) -> bool {
+        self.inner.is_present(DIGEST_ARG)
     }
 }
 
@@ -509,7 +522,7 @@ fn parse_check_line(mut line: &str) -> Result<ParsedCheckLine> {
     })
 }
 
-fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
+fn hash_one_input(path: &Path, args: &Args, digest_hasher: &mut blake3::Hasher) -> Result<()> {
     let md = metadata(path).unwrap();
     if md.is_dir() && args.recurse() {
         let mut entries = fs::read_dir(path)?
@@ -519,7 +532,7 @@ fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
         //Sort the directory entries as the order they're returned is undefined
         entries.sort();
         for entry in entries {
-            let result = hash_one_input(&entry, &args);
+            let result = hash_one_input(&entry, &args, digest_hasher);
             if let Err(e) = result {
                 eprintln!("{}: {}: {}", NAME, path.to_string_lossy(), e);
                 return Err(e);
@@ -528,6 +541,7 @@ fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
     } else {
         let mut input = Input::open(path, args)?;
         let output = input.hash(args)?;
+        let mut digest_output = output.clone();
         if args.raw() {
             write_raw_output(output, args)?;
             return Ok(());
@@ -546,6 +560,17 @@ fn hash_one_input(path: &Path, args: &Args) -> Result<()> {
         }
         write_hex_output(output, args)?;
         println!("  {}", filepath_string);
+        if args.digest() {
+            let mut len = args.len()?;
+            let mut block = [0; 8];
+            while len > 0 {
+                digest_output.fill(&mut block);
+                let take_bytes = cmp::min(len, block.len() as u64);
+                len -= take_bytes;
+                digest_hasher.update(&block);
+            }
+
+        }
     }
     Ok(())
 }
@@ -626,6 +651,7 @@ fn main() -> Result<()> {
     let thread_pool = thread_pool_builder.build()?;
     thread_pool.install(|| {
         let mut some_file_failed = false;
+        let mut digest_hasher = args.base_hasher.clone();
         // Note that file_args automatically includes `-` if nothing is given.
         for path in &args.file_args {
             if args.check() {
@@ -640,12 +666,18 @@ fn main() -> Result<()> {
                 // stderr. This allows e.g. `b3sum *` to print errors for
                 // non-files and keep going. However, if we encounter any
                 // errors we'll still return non-zero at the end.
-                let result = hash_one_input(path, &args);
+                let result = hash_one_input(path, &args, &mut digest_hasher);
                 if let Err(e) = result {
                     some_file_failed = true;
                     eprintln!("{}: {}: {}", NAME, path.to_string_lossy(), e);
                 }
             }
+        }
+        if args.digest() {
+            let digest = digest_hasher.finalize_xof();
+            println!();
+            write_hex_output(digest, &args)?;
+            println!("  <digest>");
         }
         std::process::exit(if some_file_failed { 1 } else { 0 });
     })
